@@ -53,6 +53,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
+    void * __restrict__ o_accum_ptr;
 
     // The stride between rows of O.
     index_t o_batch_stride;
@@ -64,6 +65,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The pointer to the softmax sum.
     void * __restrict__ softmax_lse_ptr;
+    void * __restrict__ softmax_lse_accum_ptr;
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded;
@@ -96,6 +98,8 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_bf16;
     bool is_causal;
+
+    int num_splits;  // For seqk_parallel version
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

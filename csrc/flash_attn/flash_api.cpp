@@ -183,6 +183,47 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
+// Find the number of splits that maximizes the occupancy. For example, if we have
+// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
+// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
+// splits as that would incur more HBM reads/writes.
+// So we find the best efficiency, then find the smallest number of splits that gets 85%
+// of the best efficiency.
+// [2022-11-25] TD: Mark this as "inline" otherwise we get "multiple definition" error.
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
+    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
+    // (i.e. it's 11 splits anyway).
+    // So we check if the number of blocks per split is the same as the previous num_splits.
+    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
+    };
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            efficiency.push_back(0.f);
+        } else {
+            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            float eff = n_waves / ceil(n_waves);
+            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+            if (eff > max_efficiency) { max_efficiency = eff; }
+            efficiency.push_back(eff);
+        }
+    }
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) { continue; }
+        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+            // printf("num_splits chosen = %d\n", num_splits);
+            return num_splits;
+        }
+    }
+    return 1;
+}
+
 std::vector<at::Tensor>
 mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x head_size
@@ -294,6 +335,14 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
                      softmax_scale,
                      is_causal);
 
+    const int block_n = head_size <= 64 ? 256 : 128;
+    const int num_n_blocks = (seqlen_k + block_n - 1) / block_n;
+    const int num_m_blocks = (seqlen_q + 64 - 1) / 64;
+    params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, dprops->multiProcessorCount, num_n_blocks, 32);
+    at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_rounded}, opts.dtype(at::kFloat));
+    params.softmax_lse_accum_ptr = softmax_lse_accum.data_ptr();
+    params.o_accum_ptr = out_accum.data_ptr();
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
@@ -320,7 +369,8 @@ mha_fwd(const at::Tensor &q,         // batch_size x seqlen_q x num_heads x head
         if (out_.has_value()) { out_.value().copy_(out); }
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    // return {out, out_accum, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return {out, out_accum, q_padded, k_padded, v_padded, out_padded, softmax_lse_accum, softmax_lse, p, rng_state};
 }
 
 std::vector<at::Tensor>
