@@ -24,10 +24,10 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler>
+template <typename Ktraits, bool Is_causal, bool Varlen, typename TileScheduler>
 __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1)
-    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal>::Params const mainloop_params,
-                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits>::Params const epilogue_params,
+    compute_attn_ws(CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits, Is_causal, Varlen>::Params const mainloop_params,
+                    CUTE_GRID_CONSTANT typename CollectiveEpilogueFwd<Ktraits, Varlen>::Params const epilogue_params,
                     CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params
                     ) {
 
@@ -46,8 +46,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
     // static constexpr int kBlockN = Ktraits::kBlockN;
     // constexpr int kHeadDim = Ktraits::kHeadDim;
 
-    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal>;
-    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits>;
+    using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Varlen>;
+    using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Varlen>;
 
     using MainloopPipeline = typename Ktraits::MainloopPipeline;
     using PipelineParams = typename MainloopPipeline::Params;
@@ -115,8 +115,9 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
                 auto block_coord = work_tile_info.get_block_coord(scheduler_params);
                 auto [m_block, bidh, bidb] = block_coord;
 
-                int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block);
-                if (Is_causal && n_block_max <= 0) {
+                int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block, bidb);
+                if ((Is_causal && n_block_max <= 0)
+                    || (Varlen && m_block * kBlockM >= collective_mainloop.get_seqlen_q(mainloop_params, bidb))) {
                     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
                     scheduler.broadcast_next_work(work_tile_info);
                     continue;
@@ -154,14 +155,17 @@ __global__ void __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp,
             auto block_coord = work_tile_info.get_block_coord(scheduler_params);
             auto [m_block, bidh, bidb] = block_coord;
 
-            int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block);
+            if (Varlen && m_block * kBlockM >= collective_mainloop.get_seqlen_q(mainloop_params, bidb)) {
+                continue;
+            }
+            int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block, bidb);
             if (Is_causal && n_block_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
                 collective_epilogue.store_zero(epilogue_params, threadIdx.x - NumCopyThreads, block_coord);
                 continue;
             }
 
             collective_mainloop.mma(mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
-                                    tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads, work_idx, m_block, shared_storage);
+                                    tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
                                     // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx, shared_storage);
             collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
                                       threadIdx.x - NumCopyThreads, block_coord);

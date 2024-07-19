@@ -21,7 +21,7 @@ namespace flash {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal>
+template <typename Ktraits, bool Is_causal, bool Varlen>
 struct CollectiveMainloopFwd {
 
     using Element = typename Ktraits::Element;
@@ -102,7 +102,9 @@ struct CollectiveMainloopFwd {
         StrideQKV const stride_K;
         Element const* ptr_V;
         StrideQKV const stride_V;
-        float const softmax_scale_log2;
+        float const softmax_scale;
+        int const* cu_seqlens_q = nullptr;
+        int const* cu_seqlens_k = nullptr;
     };
 
     // Device side kernel params
@@ -113,6 +115,8 @@ struct CollectiveMainloopFwd {
         TMA_Q tma_load_Q;
         TMA_KV tma_load_K, tma_load_V;
         float const softmax_scale_log2;
+        int const* cu_seqlens_q = nullptr;
+        int const* cu_seqlens_k = nullptr;
     };
 
 
@@ -142,7 +146,8 @@ struct CollectiveMainloopFwd {
         return {args.shape_Q, args.shape_K,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
                 tma_load_Q, tma_load_K, tma_load_V,
-                args.softmax_scale_log2};
+                float(args.softmax_scale * M_LOG2E),
+                args.cu_seqlens_q, args.cu_seqlens_k};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -154,11 +159,33 @@ struct CollectiveMainloopFwd {
     }
 
     CUTLASS_DEVICE
-    int get_n_block_max(Params const& mainloop_params, int m_block) {
+    int get_seqlen_q(Params const& mainloop_params, int bidb) {
+        if constexpr (!Varlen) {
+            return get<0>(mainloop_params.shape_Q);
+        } else {
+            return mainloop_params.cu_seqlens_q == nullptr
+                ? get<0>(mainloop_params.shape_Q)
+                : mainloop_params.cu_seqlens_q[bidb + 1] - mainloop_params.cu_seqlens_q[bidb];
+        }
+    }
+
+    CUTLASS_DEVICE
+    int get_seqlen_k(Params const& mainloop_params, int bidb) {
+        if constexpr (!Varlen) {
+            return get<0>(mainloop_params.shape_K);
+        } else {
+            return mainloop_params.cu_seqlens_k == nullptr
+                ? get<0>(mainloop_params.shape_K)
+                : mainloop_params.cu_seqlens_k[bidb + 1] - mainloop_params.cu_seqlens_k[bidb];
+        }
+    }
+
+    CUTLASS_DEVICE
+    int get_n_block_max(Params const& mainloop_params, int m_block, int bidb) {
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const seqlen_q = get<0>(mainloop_params.shape_Q);
-        int const seqlen_k = get<0>(mainloop_params.shape_K);
+        int const seqlen_q = get_seqlen_q(mainloop_params, bidb);
+        int const seqlen_k = get_seqlen_k(mainloop_params, bidb);
         int n_block_max = cute::ceil_div(seqlen_k, kBlockN);
         if constexpr (Is_causal) {
             n_block_max = std::min(n_block_max,
@@ -186,10 +213,6 @@ struct CollectiveMainloopFwd {
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
-        Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q);
-        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_K);
-        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_K);
-
         auto [m_block, bidh, bidb] = block_coord;
         int bidh_kv = mainloop_params.qhead_per_khead_divmod.divide(bidh);
 
@@ -197,9 +220,13 @@ struct CollectiveMainloopFwd {
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        Tensor gQ = local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor gK = local_tile(mK(_, _, bidh_kv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor gV = local_tile(mV(_, _, bidh_kv, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q)(_, _, bidh, !Varlen || mainloop_params.cu_seqlens_q == nullptr ? bidb : 0);
+        Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.shape_K)(_, _, bidh_kv, !Varlen || mainloop_params.cu_seqlens_k == nullptr ? bidb : 0);
+        Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.shape_K)(_, _, bidh_kv, !Varlen || mainloop_params.cu_seqlens_k == nullptr ? bidb : 0);
+
+        Tensor gQ = local_tile(domain_offset(make_coord(!Varlen || mainloop_params.cu_seqlens_q == nullptr ? 0 : mainloop_params.cu_seqlens_q[bidb], _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
+        Tensor gK = local_tile(domain_offset(make_coord(!Varlen || mainloop_params.cu_seqlens_k == nullptr ? 0 : mainloop_params.cu_seqlens_k[bidb], _0{}), mK), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+        Tensor gV = local_tile(domain_offset(make_coord(!Varlen || mainloop_params.cu_seqlens_k == nullptr ? 0 : mainloop_params.cu_seqlens_k[bidb], _0{}), mV), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
         Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
         Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
@@ -218,7 +245,7 @@ struct CollectiveMainloopFwd {
             }
         }
 
-        int n_block_max = get_n_block_max(mainloop_params, m_block);
+        int n_block_max = get_n_block_max(mainloop_params, m_block, bidb);
         int n_block = n_block_max - 1;
 
         int lane_predicate = cute::elect_one_sync();
@@ -330,7 +357,7 @@ struct CollectiveMainloopFwd {
         int n_block_count,
         int thread_idx,
         int work_idx,
-        int m_block,
+        cute::tuple<int32_t, int32_t, int32_t> block_coord,
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
@@ -360,8 +387,12 @@ struct CollectiveMainloopFwd {
         };
 
         tiled_mma1.accumulate_ = GMMA::ScaleOut::Zero;
-        int const seqlen_q = get<0>(mainloop_params.shape_Q);
-        int const seqlen_k = get<0>(mainloop_params.shape_K);
+
+        int m_block = get<0>(block_coord);
+        int bidb = get<2>(block_coord);
+        int const seqlen_q = get_seqlen_q(mainloop_params, bidb);
+        int const seqlen_k = get_seqlen_k(mainloop_params, bidb);
+        // if (blockIdx.x == 0  && threadIdx.x == 128) { printf("seqlen_q: %d, seqlen_k: %d\n", seqlen_q, seqlen_k); }
         int n_block = n_block_count - 1;
 
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.barrier_Q.try_wait(work_idx % 2));
@@ -375,7 +406,7 @@ struct CollectiveMainloopFwd {
         if (work_idx != 0) {
             int lane_predicate = cute::elect_one_sync();
             if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
-                tma_store_wait<0>();
+                if constexpr (!Varlen) { tma_store_wait<0>(); }
                 #pragma unroll
                 for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
                     shared_storage.barrier_O.arrive(cta_id, lane_predicate);
@@ -386,8 +417,8 @@ struct CollectiveMainloopFwd {
         pipeline_k.consumer_release(smem_pipe_read_k);
         ++smem_pipe_read_k;
 
-        auto col_limit_causal = [&](int row, int n_block) {
-            return row + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
+        auto causal_row_offset = [&](int n_block) {
+            return 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
         };
         {
             Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
@@ -400,8 +431,10 @@ struct CollectiveMainloopFwd {
                     // using std::min is faster than doing col >= limit0 or col >= limit1
                     // Need to cast get<1>(tScS(i)) to (signed) int since by default it's unsigned, and the
                     // right hand side can be negative and might be converted to a very large unsigned integer.
-                    if (int(get<1>(tScS(i))) >= std::min(seqlen_k - n_block * kBlockN,
-                                                        col_limit_causal(int(get<0>(tScS(i))), n_block))) {
+                    if (int(get<1>(tScS(i))) >= std::min(int(get<0>(tScS(i))) + causal_row_offset(n_block),
+                    // if (int(get<1>(tScS(i))) >= __viaddmin_s32(int(get<0>(tScS(i))), causal_row_offset(n_block),
+                    // if (int(get<1>(tScS(i))) >= std::min(__viaddmax_s32(int(get<0>(tScS(i))), causal_row_offset(n_block), int(16)),
+                                                         seqlen_k - n_block * kBlockN)) {
                         tSrS(i) = -INFINITY;
                     }
                 }
@@ -431,7 +464,9 @@ struct CollectiveMainloopFwd {
             Tensor tScS = threadMma0.partition_C(cS);
             #pragma unroll
             for (int i = 0; i < size(tSrS); ++i) {
-                if (int(get<1>(tScS(i))) >= col_limit_causal(int(get<0>(tScS(i))), n_block - 1)) {
+                if (int(get<1>(tScS(i))) >= int(get<0>(tScS(i))) + causal_row_offset(n_block - 1)) {
+                // if (int(get<1>(tScS(i))) >= std::max(int(get<0>(tScS(i))) + causal_row_offset(n_block - 1), int(16))) {
+                // if (int(get<1>(tScS(i))) >= __viaddmax_s32(int(get<0>(tScS(i))), causal_row_offset(n_block - 1), int(16))) {
                     tSrS(i) = -INFINITY;
                 }
             }
