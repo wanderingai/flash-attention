@@ -26,6 +26,21 @@ def _flash_attn_forward(q, k, v, softmax_scale, causal):
     return out, q, k, v, out_padded, softmax_lse, S_dmask
 
 
+def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
+    maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, q, k, v, out_padded, softmax_lse, S_dmask = flashattn_hopper_cuda.fwd_varlen(
+        q,
+        k,
+        v,
+        None,
+        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
+    return out, q, k, v, out_padded, softmax_lse, S_dmask
+
+
 def _flash_attn_backward(
     dout,
     q,
@@ -74,6 +89,61 @@ class FlashAttnFunc(torch.autograd.Function):
             q,
             k,
             v,
+            softmax_scale,
+            causal
+        )
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        return out, softmax_lse
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            ctx.softmax_scale,
+            ctx.causal,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    ):
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
             softmax_scale,
             causal
         )
@@ -164,6 +234,30 @@ def flash_attn_func(
         q,
         k,
         v,
+        softmax_scale,
+        causal,
+    )
+
+
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale=None,
+    causal=False,
+):
+    return FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
         softmax_scale,
         causal,
     )

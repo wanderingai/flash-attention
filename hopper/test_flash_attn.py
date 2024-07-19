@@ -5,10 +5,136 @@ import torch
 import torch.nn.functional as F
 
 from einops import rearrange, repeat
-from flash_attn_interface import flash_attn_func
+from flash_attn.bert_padding import pad_input, unpad_input
+
+from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 
 ABS_TOL = 5e-3
 REL_TOL = 1e-1
+
+
+def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
+    assert mode in ["full", "random", "third"]
+    if mode == "full":
+        lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
+    elif mode == "random":
+        lengths = torch.randint(
+            max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1), device=device
+        )
+    elif mode == "third":
+        lengths = torch.randint(max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    )
+    return padding_mask
+
+
+def generate_qkv(
+    q, k, v, query_padding_mask=None, key_padding_mask=None, kvpacked=False, qkvpacked=False
+):
+    """
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, d)
+        k: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d)
+        query_padding_mask: (batch_size, seqlen), bool
+        key_padding_mask: (batch_size, seqlen), bool
+    """
+    assert not (kvpacked and qkvpacked)
+    batch_size, seqlen_q, nheads, d = q.shape
+    _, seqlen_k, nheads_k, _ = k.shape
+    assert k.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+
+    if query_padding_mask is not None:
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(q, query_padding_mask)
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
+    else:
+        q_unpad = rearrange(q, "b s h d -> (b s) h d")
+        cu_seqlens_q = torch.arange(
+            0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=q_unpad.device
+        )
+        max_seqlen_q = seqlen_q
+        output_pad_fn = lambda output_unpad: rearrange(
+            output_unpad, "(b s) h d -> b s h d", b=batch_size
+        )
+
+    if key_padding_mask is not None:
+        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k = unpad_input(k, key_padding_mask)
+        v_unpad, _, _, _ = unpad_input(v, key_padding_mask)
+    else:
+        k_unpad = rearrange(k, "b s h d -> (b s) h d")
+        v_unpad = rearrange(v, "b s h d -> (b s) h d")
+        cu_seqlens_k = torch.arange(
+            0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=k_unpad.device
+        )
+        max_seqlen_k = seqlen_k
+
+    if qkvpacked:
+        assert (query_padding_mask == key_padding_mask).all()
+        assert nheads == nheads_k
+        qkv_unpad = torch.stack([q_unpad, k_unpad, v_unpad], dim=1)
+        qkv = torch.stack([q, k, v], dim=2)
+        if query_padding_mask is not None:
+            dqkv_pad_fn = lambda dqkv_unpad: pad_input(dqkv_unpad, indices_q, batch_size, seqlen_q)
+        else:
+            dqkv_pad_fn = lambda dqkv_unpad: rearrange(
+                dqkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+            )
+        return (
+            qkv_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            max_seqlen_q,
+            qkv.detach().requires_grad_(),
+            output_pad_fn,
+            dqkv_pad_fn,
+        )
+    elif kvpacked:
+        kv_unpad = torch.stack([k_unpad, v_unpad], dim=1)
+        kv = torch.stack([k, v], dim=2)
+        dq_pad_fn = output_pad_fn
+        if key_padding_mask is not None:
+            dkv_pad_fn = lambda dkv_unpad: pad_input(dkv_unpad, indices_k, batch_size, seqlen_k)
+        else:
+            dkv_pad_fn = lambda dkv_unpad: rearrange(
+                dkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+            )
+        return (
+            q_unpad.detach().requires_grad_(),
+            kv_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q.detach().requires_grad_(),
+            kv.detach().requires_grad_(),
+            output_pad_fn,
+            dq_pad_fn,
+            dkv_pad_fn,
+        )
+    else:
+        dq_pad_fn = output_pad_fn
+        if key_padding_mask is not None:
+            dk_pad_fn = lambda dk_unpad: pad_input(dk_unpad, indices_k, batch_size, seqlen_k)
+        else:
+            dk_pad_fn = lambda dk_unpad: rearrange(dk_unpad, "(b s) h d -> b s h d", b=batch_size)
+        return (
+            q_unpad.detach().requires_grad_(),
+            k_unpad.detach().requires_grad_(),
+            v_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q.detach().requires_grad_(),
+            k.detach().requires_grad_(),
+            v.detach().requires_grad_(),
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        )
 
 def construct_local_mask(
     seqlen_q,
@@ -102,8 +228,8 @@ def attention_ref(
             seqlen_q,
             seqlen_k,
             (-1, 0),
-            None,
-            None,
+            query_padding_mask,
+            key_padding_mask,
             q.device,
         )
         scores.masked_fill_(local_mask, float("-inf"))
@@ -250,3 +376,103 @@ def test_flash_attn_output(
     #     assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
     #     assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
     #     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
+# @pytest.mark.parametrize('d', [56, 80])
+@pytest.mark.parametrize("d", [64, 128, 256])
+# @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+def test_flash_attn_varlen_output(
+    seqlen_q, seqlen_k, d, causal, mha_type, dtype
+):
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    # batch_size = 40
+    # nheads = 16
+    batch_size = 9
+    nheads = 6
+    # batch_size = 1
+    # nheads = 1
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
+    query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
+    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, device, mode="random")
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    out_unpad, lse = flash_attn_varlen_func(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=causal)
+    out = output_pad_fn(out_unpad)
+    out_ref, attn_ref = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+    )
+    out_pt, attn_pt = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+    # if not causal:
+    #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+    # breakpoint()
+
+    # Check that FlashAttention's numerical error is at most twice the numerical error
+    # of a Pytorch implementation.
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
